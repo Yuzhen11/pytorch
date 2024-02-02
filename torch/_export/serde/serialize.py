@@ -1108,6 +1108,22 @@ class GraphModuleDeserializer:
                             runtime_min=vr.lower,  # type: ignore[arg-type]
                             runtime_max=vr.upper  # type: ignore[arg-type]
                         )
+                else:
+                    self.symbol_name_to_symbol[val.expr_str] = sym
+                    free_symbols = sym.free_symbols
+                    for s in free_symbols:
+                        if s.name not in self.symbol_name_to_symbol:
+                            self.symbol_name_to_symbol[s.name] = s
+                        if vr := self.symbol_name_to_range.get(s.name):
+                            symbolic_shapes._constrain_symbol_range(
+                                self.shape_env,
+                                s,
+                                compiler_min=vr.lower,  # type: ignore[arg-type]
+                                compiler_max=vr.upper,  # type: ignore[arg-type]
+                                runtime_min=vr.lower,  # type: ignore[arg-type]
+                                runtime_max=vr.upper  # type: ignore[arg-type]
+                            )
+
 
             if val.hint is None:
                 hint = None

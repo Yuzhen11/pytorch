@@ -10,11 +10,15 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING, Un
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 from torch.utils._pytree import SUPPORTED_NODES
+
 from .exported_program import ExportedProgram
 
 if TYPE_CHECKING:
-    from ..fx.experimental.symbolic_shapes import StrictMinMaxConstraint
+    from sympy import Symbol
 
+    from torch._guards import Source
+
+    from ..fx.experimental.symbolic_shapes import ShapeEnv, StrictMinMaxConstraint
 
 __all__ = ["Constraint", "Dim", "dims", "dynamic_dim"]
 
@@ -37,6 +41,38 @@ class _Dim(type):
         if max_ is None:
             return f"Dim('{name}', min={min_})"
         return f"Dim('{name}', min={min_}, max={max_})"
+
+    def __add__(cls, other):
+        assert type(other) is int, f"Expected int, got {type(other)}"
+        return cls._derive(f"({cls.__name__}+{other})", lambda x: x + other)
+
+    def __sub__(cls, other):
+        assert type(other) is int, f"Expected int, got {type(other)}"
+        return cls._derive(f"({cls.__name__}-{other})", lambda x: x - other)
+
+    def __mul__(cls, other):
+        assert type(other) is int, f"Expected int, got {type(other)}"
+        return cls._derive(f"({cls.__name__}*{other})", lambda x: x * other)
+
+    def _derive(cls, name, fn):
+        return _DerivedDim(name, (int,), {"root": cls, "fn": fn})
+
+
+class _DerivedDim(_Dim):
+    @property
+    def min(self):
+        # assume monotonic
+        return self.fn(self.root.min)  # type: ignore[attr-defined]
+
+    @property
+    def max(self):
+        # assume monotonic
+        return self.fn(self.root.max)  # type: ignore[attr-defined]
+
+    def _derive(self, name, fn):
+        return _DerivedDim(
+            name, (int,), {"root": self.root, "fn": lambda x: fn(self.fn(x))}  # type: ignore[attr-defined]
+        )
 
 
 def Dim(name: str, *, min: Optional[int] = None, max: Optional[int] = None):
@@ -183,14 +219,6 @@ class Constraint(_ConstraintTarget, metaclass=_ConstraintFactory):
             "dim": self.dim,
             "min": self.constraint_range.vr.lower,
             "max": self.constraint_range.vr.upper,
-            "shared": (
-                None
-                if self.shared is None
-                else {
-                    "t_id": self.shared.t_id,
-                    "dim": self.shared.dim,
-                }
-            ),
         }
 
     def __eq__(self, other):
@@ -220,6 +248,35 @@ class Constraint(_ConstraintTarget, metaclass=_ConstraintFactory):
             shared=_ConstraintTarget(other.w_tensor, other.t_id, other.dim),
             debug_name=debug_name,
         )
+
+
+@dataclasses.dataclass
+class _PhantomRoot:
+    name: str
+    constraint_range: "StrictMinMaxConstraint"
+    val: int
+
+
+@dataclasses.dataclass
+class _DerivedConstraint(_ConstraintTarget):
+    root: Union[_ConstraintTarget, _PhantomRoot]
+    fn: Callable
+    constraint_range: "StrictMinMaxConstraint"
+    debug_name: Optional[str] = None
+
+    @property
+    def shared(self):
+        return None
+
+    @property
+    def serializable_spec(self):
+        # same as Constraint.serializable_spec
+        return {
+            "t_id": self.t_id,
+            "dim": self.dim,
+            "min": self.constraint_range.vr.lower,
+            "max": self.constraint_range.vr.upper,
+        }
 
 
 def dynamic_dim(t: torch.Tensor, index: int, debug_name: Optional[str] = None):
@@ -328,6 +385,46 @@ def dynamic_dim(t: torch.Tensor, index: int, debug_name: Optional[str] = None):
     )
 
 
+def _process_equalities(
+    constraint: Union[Constraint, _DerivedConstraint],
+    get_sources: Callable[[int, int], List["Source"]],
+    shape_env: "ShapeEnv",
+    source_pairs: List[Tuple["Source", "Source"]],
+    derived_equalities: List[Tuple["Source", Union["Source", "Symbol"], Callable]],
+    phantom_symbols: Dict[str, "Symbol"],
+):
+    source, *other_sources = get_sources(constraint.t_id, constraint.dim)
+    # When t.size()[dim] maps to src0, src1, ..., srcN, we add
+    # constraints that make src0 "equal" to src1, ..., srcN.
+    source_pairs.extend((source, other_source) for other_source in other_sources)
+    if isinstance(constraint, _DerivedConstraint):
+        if isinstance(constraint.root, _PhantomRoot):
+            if constraint.root.name in phantom_symbols:
+                phantom_symbol = phantom_symbols[constraint.root.name]
+            else:
+                phantom_symbol = shape_env.create_symbol(
+                    val=constraint.root.val,
+                    source=torch._dynamo.source.ConstantSource(constraint.root.name),
+                    dynamic_dim=torch.fx.experimental.symbolic_shapes.DimDynamic.DYNAMIC,
+                    constraint_dim=constraint.root.constraint_range,
+                )
+                phantom_symbols[constraint.root.name] = phantom_symbol
+            root = phantom_symbol
+        else:
+            root = get_sources(constraint.root.t_id, constraint.root.dim)[0]  # type: ignore[assignment]
+        fn = constraint.fn
+        derived_equalities.append((source, root, fn))
+    else:
+        if constraint.shared is not None:
+            # Moreover, when t.size()[dim] is specified equal to t'.size()[dim']
+            # and t'.size()[dim'] maps to src1', ..., srcN', we add
+            # constraints that also make src0 "equal" to src1', ..., srcN'.
+            other_sources = get_sources(constraint.shared.t_id, constraint.shared.dim)
+            source_pairs.extend(
+                (source, other_source) for other_source in other_sources
+            )
+
+
 def _process_dynamic_shapes(
     f: Callable,
     args: Tuple[Any, ...],
@@ -394,12 +491,67 @@ def _process_dynamic_shapes(
                     f"got {dynamic_shapes} instead",
                 )
 
+    phantom_roots: Dict[str, _PhantomRoot] = {}
+
     def to_constraint(dim, tensor, i):
-        constraint = dynamic_dim(tensor, i, debug_name=dim.__name__)
-        if dim.min != 2:
-            constraint = constraint >= dim.min
-        if dim.max != sys.maxsize - 1:
-            constraint = constraint <= dim.max
+        import sympy
+
+        from torch.fx.experimental.symbolic_shapes import (
+            DimConstraints,
+            StrictMinMaxConstraint,
+        )
+        from torch.utils._sympy.value_ranges import ValueRanges
+
+        def get_value():
+            try:
+                return DimConstraints.solve_supported_equivalence(
+                    dim.fn(sympy.Symbol(dim.root.__name__)), tensor.shape[i]
+                )
+            except ValueError as e:
+                raise UserError(  # noqa: TRY200
+                    UserErrorType.CONSTRAINT_VIOLATION,
+                    e.args[0],
+                )
+
+        if isinstance(dim, _DerivedDim):
+            dim_root = dim.root  # type: ignore[attr-defined]
+            if dim_root.__name__ in symbols:
+                root_constraint = symbols[dim_root.__name__][0]
+                root = _ConstraintTarget(
+                    root_constraint.w_tensor,
+                    root_constraint.t_id,
+                    root_constraint.dim,
+                )
+            elif dim_root.__name__ not in phantom_roots:
+                root = _PhantomRoot(  # type: ignore[assignment]
+                    name=dim_root.__name__,
+                    constraint_range=StrictMinMaxConstraint(
+                        vr=ValueRanges(lower=dim_root.min, upper=dim_root.max),
+                        warn_only=False,
+                    ),
+                    val=get_value(),
+                )
+                phantom_roots[dim_root.__name__] = root
+            else:
+                root = phantom_roots[dim_root.__name__]
+            constraint = _DerivedConstraint(
+                weakref.ref(tensor),
+                id(tensor),
+                i,
+                root,
+                dim.fn,  # type: ignore[attr-defined]
+                StrictMinMaxConstraint(
+                    vr=ValueRanges(lower=dim.min, upper=dim.max),
+                    warn_only=False,
+                ),
+                debug_name=dim.__name__,
+            )
+        else:
+            constraint = dynamic_dim(tensor, i, debug_name=dim.__name__)
+            if dim.min != 2:
+                constraint = constraint >= dim.min
+            if dim.max != sys.maxsize - 1:
+                constraint = constraint <= dim.max
         return constraint
 
     from collections import defaultdict
@@ -483,6 +635,7 @@ def _process_dynamic_shapes(
 
 
 def _process_constraints(
+    fake_mode,
     graph_module: torch.fx.GraphModule,
     num_lifted_params_buffers: int,
     example_inputs: List[torch.Tensor],
@@ -548,6 +701,7 @@ def _process_constraints(
         symbol: inline_constraints[symbol] for symbol in inline_constraints
     }
 
+    free_symbols = set()
     # Add input range constraints to range_constraints
     for input_dim, multi_range_constraint in multi_range_constraints.items():  # type: ignore[assignment]
         # Simplify the range constraints into a single range constraint
@@ -565,7 +719,13 @@ def _process_constraints(
         assert isinstance(
             symint, SymInt
         ), f"Expected SymInt but got {symint}: {type(symint)}"
-        symbol = symint.node._expr
+        symbol = symint.node.expr
+        # print(val.fake_mode)
         range_constraints[symbol] = ValueRanges(min_val, max_val)
+        free_symbols.update(symbol.free_symbols)
+
+    for symbol in free_symbols:
+        if symbol not in range_constraints:
+            range_constraints[symbol] = fake_mode.shape_env.var_to_range[symbol]
 
     return range_constraints
