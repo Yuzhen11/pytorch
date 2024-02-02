@@ -329,7 +329,6 @@ def speculate_subgraph(
     # use set_subgraph_inputs="manual" (not recommended). We do not recommend it in general because it has the
     # restriction that user need to manually control how to create placeholders and VariableTrackers for the args.
     set_subgraph_inputs="automatic",
-    restore_side_effects=True,
     should_flatten_outputs=False,
     # Pass in an originating tracer - this is needed for preserving context
     # across fwd-bwd for autograd.Function
@@ -374,18 +373,32 @@ def speculate_subgraph(
                 else contextlib.nullcontext()
             )
 
-            if restore_side_effects:
-                prev_side_effects = tx.output.side_effects.clone()
+            # For handling side effects, we can make an argument that we don't
+            # have to do anything here. The side effects infra does a good job
+            # of graph breaking if we mutate any nonlocal or global variable
+            # while subtracing. As a result if tracing succeeds, side effects
+            # data structure will only contain read-only data structures that
+            # are put there for tracking purposes.
+            # But on the other hand, there is an argument that if we ever write
+            # a new side effect in Dynamo which does not go through the side
+            # effect infra, we can end up in bad state.
+            # Therefore we restore the side effects after tracing. The catch is
+            # that we have to special handle tensor variables. If we have seen a
+            # nonlocal variable tensor during subtracing, we want to keep a
+            # track of that tensor, so that later subtracing or the root tracer
+            # itself does not create a new proxy for the already observed tensor
+            # variable.
+            prev_side_effects = tx.output.side_effects.clone()
 
             with autograd_ctx:
                 output = f.call_function(tx, args, sub_kwargs)
 
-            if restore_side_effects:
-                # Captured variables are tracked in side-effects
-                # and they show up in output graph incorrectly.
-                # It is ok to undo this side-effect tracking
-                # as speculate_subgraph will allow only
-                # pure functions.
+            new_side_effects = tx.output.side_effects.clone()
+
+            if prev_side_effects.diff(new_side_effects) is not None:
+                prev_side_effects.track_tensor_variables_from_runahead_side_effects(
+                    new_side_effects
+                )
                 tx.output.side_effects = prev_side_effects
 
             treespec = None
@@ -1522,7 +1535,6 @@ class AutogradFunctionApplyVariable(VariableTracker):
             kwargs,
             "autograd.Function",
             set_subgraph_inputs="manual",
-            restore_side_effects=False,
             tracer=fwd_tracer,
         )
 
@@ -1575,7 +1587,6 @@ class AutogradFunctionApplyVariable(VariableTracker):
                 "autograd.Function",
                 enable_grad=False,
                 set_subgraph_inputs="manual",
-                restore_side_effects=False,
                 tracer=bwd_tracer,
             )
 
